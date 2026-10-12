@@ -1,0 +1,19 @@
+{
+  "name": "subtitle-translator",
+  "version": "1.0.0",
+  "description": "Translate SRT, VTT and ASS subtitle files with @vitalets/google-translate-api",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@vitalets/google-translate-api": "^9.2.0",
+    "express": "^4.19.2"
+  }
+}

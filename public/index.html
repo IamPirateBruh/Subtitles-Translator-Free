@@ -33,19 +33,28 @@
   </header>
 
   <main class="layout">
+    <div id="serverWarn" class="warn" role="alert" hidden></div>
+
     <section class="panel controls" aria-label="Translation settings">
       <label id="drop" class="drop" tabindex="0">
-        <input id="file" type="file" accept=".srt,.vtt,.ass,.ssa,.txt" hidden>
-        <strong>Drop a subtitle file here</strong>
-        <span>or click to browse. Supports .srt, .vtt, .ass and .ssa</span>
+        <input id="file" type="file" accept=".srt,.vtt,.ass,.ssa,.txt" multiple hidden>
+        <strong>Drop subtitle files here</strong>
+        <span>One file or many. Click to browse. Supports .srt, .vtt, .ass and .ssa</span>
       </label>
 
-      <div id="fileInfo" class="file-info" hidden></div>
+      <div id="files" class="files" hidden>
+        <div class="files-head">
+          <span id="filesTitle">File</span>
+          <button id="clearFiles" class="link-btn" type="button">Clear all</button>
+        </div>
+        <ul id="fileList" class="file-list"></ul>
+        <div id="fileInfo" class="file-info"></div>
+      </div>
 
       <details class="paste">
         <summary>Paste subtitle text instead</summary>
         <textarea id="pasteArea" rows="6" placeholder="Paste SRT, VTT or ASS content here"></textarea>
-        <button id="pasteLoad" class="btn" type="button">Load pasted text</button>
+        <button id="pasteLoad" class="btn" type="button">Add pasted text</button>
       </details>
       <button id="sampleBtn" class="link-btn" type="button">Try a Spanish sample</button>
 
@@ -102,13 +111,21 @@
       <div id="exportBar" class="exportbar" hidden>
         <div class="field inline">
           <label for="outFmt">Save as</label>
-          <select id="outFmt"></select>
+          <select id="outFmt">
+            <option value="same">Same as source</option>
+            <option value="srt">SRT</option>
+            <option value="vtt">WebVTT</option>
+          </select>
         </div>
-        <button id="downloadBtn" class="btn primary" type="button">Download</button>
-        <button id="copyBtn" class="btn" type="button">Copy text</button>
+        <div class="export-actions">
+          <button id="copyBtn" class="btn" type="button">Copy text</button>
+          <button id="downloadBtn" class="btn primary" type="button">Download</button>
+          <button id="downloadAllBtn" class="btn primary" type="button" hidden>Download all (ZIP)</button>
+        </div>
       </div>
 
       <div id="cuesWrap" class="panel cues" hidden>
+        <div class="cues-title">Editing <b id="activeName"></b></div>
         <div class="cues-tools">
           <input id="search" type="search" placeholder="Search cues" aria-label="Search cues">
           <button id="retryBtn" class="btn" type="button" hidden>Retry failed (<span id="failCount">0</span>)</button>

@@ -7,31 +7,42 @@ import {
   formatTime,
   formatDuration,
 } from './subtitles.js';
+import { makeZip, uniqueName } from './zip.js';
 
 /* ---------- setup ---------- */
 
 const PAGE_SIZE = 50;
 const BATCH = { maxItems: 80, maxChars: 4500, delimLen: 5 };
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_FILES = 100;
+const SUBTITLE_EXT = /\.(srt|vtt|ass|ssa|txt)$/i;
+const BACKEND_HINT =
+  "The translation server isn't running. In the project folder, run \"npm install\" and then \"npm start\", " +
+  'and open http://localhost:3000. A plain file server (such as python -m http.server) cannot translate.';
 
 const $ = (sel) => document.querySelector(sel);
 const el = Object.fromEntries(
   Object.entries({
-    drop: '#drop', file: '#file', fileInfo: '#fileInfo', pasteArea: '#pasteArea', pasteLoad: '#pasteLoad',
+    drop: '#drop', file: '#file', files: '#files', filesTitle: '#filesTitle', clearFiles: '#clearFiles',
+    fileList: '#fileList', fileInfo: '#fileInfo', pasteArea: '#pasteArea', pasteLoad: '#pasteLoad',
     sample: '#sampleBtn', from: '#fromLang', to: '#toLang', swap: '#swapBtn',
     optTags: '#optTags', optBi: '#optBi', optBom: '#optBom',
     translate: '#translateBtn', cancel: '#cancelBtn', progress: '#progress', barFill: '#barFill', status: '#status',
     cueLabel: '#cueLabel', cueTime: '#cueTime', prevCue: '#prevCue', nextCue: '#nextCue',
     capOrig: '#capOrig', capTrans: '#capTrans',
-    exportBar: '#exportBar', outFmt: '#outFmt', download: '#downloadBtn', copy: '#copyBtn',
-    cuesWrap: '#cuesWrap', search: '#search', retry: '#retryBtn', failCount: '#failCount',
+    exportBar: '#exportBar', outFmt: '#outFmt', download: '#downloadBtn', downloadAll: '#downloadAllBtn', copy: '#copyBtn',
+    cuesWrap: '#cuesWrap', activeName: '#activeName', search: '#search', retry: '#retryBtn', failCount: '#failCount',
     pgPrev: '#pgPrev', pgNext: '#pgNext', pgLabel: '#pgLabel', cueList: '#cueList',
-    toast: '#toast', theme: '#themeBtn',
+    toast: '#toast', theme: '#themeBtn', serverWarn: '#serverWarn',
   }).map(([key, sel]) => [key, $(sel)]),
 );
 
 const state = {
-  doc: null,
+  files: [], // [{ id, name, doc }]
+  activeId: null,
+  nextId: 1,
+  pasted: 0,
+  doc: null, // the file shown in the editor
   fileName: 'subtitles',
   cache: new Map(),
   running: false,
@@ -48,6 +59,7 @@ const store = {
 };
 
 const LANG_NAMES = new Map(LANGS.map(([code, name]) => [code.toLowerCase(), name]));
+const langName = (code) => LANG_NAMES.get(String(code).toLowerCase()) ?? code;
 const fmtNum = (n) => n.toLocaleString();
 
 const SAMPLE = `1
@@ -93,7 +105,7 @@ function toast(msg) {
   el.toast.textContent = msg;
   el.toast.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.toast.classList.remove('show'), 4500);
+  toastTimer = setTimeout(() => el.toast.classList.remove('show'), 5000);
 }
 
 function sleep(ms, signal) {
@@ -122,6 +134,9 @@ const readOpts = () => ({
   bom: el.optBom.checked,
 });
 
+/** True when the cue already has a translation into language `to`. */
+const isDoneFor = (c, to) => c.status === 'done' && c.lang === to;
+
 /* ---------- languages and settings ---------- */
 
 function fillLanguages() {
@@ -135,6 +150,8 @@ function fillLanguages() {
   el.optTags.checked = store.get('st-tags') !== '0';
   el.optBi.checked = store.get('st-bi') === '1';
   el.optBom.checked = store.get('st-bom') === '1';
+  el.outFmt.value = store.get('st-out') || 'same';
+  if (!el.outFmt.value) el.outFmt.value = 'same';
   syncSwap();
 }
 
@@ -144,13 +161,14 @@ function saveSettings() {
   store.set('st-tags', el.optTags.checked ? '1' : '0');
   store.set('st-bi', el.optBi.checked ? '1' : '0');
   store.set('st-bom', el.optBom.checked ? '1' : '0');
+  store.set('st-out', el.outFmt.value);
 }
 
 function syncSwap() {
   el.swap.disabled = el.from.value === 'auto';
 }
 
-/* ---------- loading files ---------- */
+/* ---------- file queue ---------- */
 
 function decode(buffer) {
   const b = new Uint8Array(buffer);
@@ -163,66 +181,190 @@ function decode(buffer) {
   }
 }
 
-async function loadFile(file) {
-  if (file.size > MAX_FILE_BYTES) {
-    return toast('That file is over 5 MB. Subtitle files are usually far smaller.');
-  }
-  ingest(decode(await file.arrayBuffer()), file.name);
+function busyToast() {
+  toast('Wait for the translation to finish, or cancel it, before changing the files.');
 }
 
-function ingest(raw, name) {
-  if (state.running) state.controller?.abort();
+async function loadFiles(fileList) {
+  const files = [...fileList];
+  if (!files.length) return;
+  if (state.running) return busyToast();
 
-  let doc;
-  try {
-    doc = parseSubtitles(raw, name);
-  } catch (err) {
-    console.error(err);
-    return toast("That file couldn't be read as subtitles.");
+  const items = [];
+  const notes = [];
+  for (const f of files) {
+    if (!SUBTITLE_EXT.test(f.name)) notes.push(`${f.name} isn't a subtitle file`);
+    else if (f.size > MAX_FILE_BYTES) notes.push(`${f.name} is over 5 MB`);
+    else items.push({ name: f.name, raw: decode(await f.arrayBuffer()) });
   }
-  if (!doc.cues.length) {
-    return toast('No subtitle cues found. Check that the file is SRT, VTT or ASS.');
+  addFiles(items, notes);
+}
+
+function addFiles(items, notes = []) {
+  if (state.running) return busyToast();
+
+  const room = Math.max(0, MAX_FILES - state.files.length);
+  if (items.length > room) {
+    notes.push(`only ${MAX_FILES} files fit at once, so ${items.length - room} were not added`);
+    items = items.slice(0, room);
   }
 
-  Object.assign(state, {
-    doc,
-    fileName: name || 'subtitles',
-    selected: 0,
-    page: 0,
-    query: '',
-    detected: null,
-  });
+  const added = [];
+  for (const { name, raw } of items) {
+    try {
+      const doc = parseSubtitles(raw, name);
+      if (!doc.cues.length) {
+        notes.push(`${name} has no subtitle cues`);
+        continue;
+      }
+      const entry = { id: state.nextId++, name, doc };
+      state.files.push(entry);
+      added.push(entry);
+    } catch (err) {
+      console.error(err);
+      notes.push(`${name} couldn't be read`);
+    }
+  }
+
+  if (added.length) {
+    el.progress.hidden = true;
+    if (!state.activeId) activate(added[0].id);
+  }
+  refreshChrome();
+
+  if (notes.length) {
+    const shown = notes.slice(0, 2).join('. ');
+    toast(`${shown}${notes.length > 2 ? `. And ${notes.length - 2} more problems` : ''}.`);
+  } else if (added.length > 1) {
+    toast(`${added.length} files added.`);
+  }
+}
+
+function resetActive() {
+  Object.assign(state, { activeId: null, doc: null, fileName: 'subtitles', selected: 0, page: 0, query: '' });
   el.search.value = '';
   el.progress.hidden = true;
-  el.exportBar.hidden = false;
-  el.cuesWrap.hidden = false;
-  el.translate.disabled = false;
+  updatePreview();
+}
 
-  fillOutputFormats();
-  renderFileInfo();
+function removeFile(id) {
+  if (state.running) return busyToast();
+  state.files = state.files.filter((f) => f.id !== id);
+  if (state.activeId === id) {
+    const next = state.files[0];
+    if (next) activate(next.id);
+    else resetActive();
+  }
+  refreshChrome();
+}
+
+function clearFiles() {
+  if (state.running) return busyToast();
+  state.files = [];
+  resetActive();
+  refreshChrome();
+}
+
+function activate(id) {
+  const entry = state.files.find((f) => f.id === id);
+  if (!entry) return;
+  Object.assign(state, { activeId: id, doc: entry.doc, fileName: entry.name, selected: 0, page: 0, query: '' });
+  el.search.value = '';
+  el.activeName.textContent = entry.name;
+  renderFiles();
   renderCues();
   updatePreview();
 }
 
-function renderFileInfo() {
-  const { doc } = state;
-  const last = doc.cues.at(-1)?.end ?? 0;
-  const unique = groupByCore(doc.cues).size;
-  el.fileInfo.replaceChildren(
-    h('b', {}, state.fileName),
-    h('span', {}, `${doc.format.toUpperCase()}, ${fmtNum(doc.cues.length)} cues, ${formatDuration(last)} long`),
-    h('span', {}, `${fmtNum(unique)} unique lines will be sent to Google Translate`),
-  );
-  el.fileInfo.hidden = false;
+function fileStats(doc, to) {
+  const s = { total: 0, done: 0, failed: 0, pending: 0 };
+  for (const c of doc.cues) {
+    if (c.skip) continue;
+    s.total++;
+    if (isDoneFor(c, to)) s.done++;
+    else if (c.status === 'failed') s.failed++;
+    else if (c.status === 'pending') s.pending++;
+  }
+  return s;
 }
 
-function fillOutputFormats() {
-  const names = { srt: 'SRT', vtt: 'WebVTT', ass: 'ASS' };
-  const f = state.doc.format;
-  const order = f === 'ass' ? ['ass', 'srt', 'vtt'] : f === 'vtt' ? ['vtt', 'srt'] : ['srt', 'vtt'];
-  el.outFmt.innerHTML = order
-    .map((k) => `<option value="${k}">${names[k]}${k === f ? ' (same as source)' : ''}</option>`)
-    .join('');
+function statusLabel(s) {
+  const pct = s.total ? Math.round((100 * s.done) / s.total) : 0;
+  if (!s.total) return 'Nothing to translate';
+  if (s.pending) return `Translating ${pct}%`;
+  if (s.failed) return `${fmtNum(s.failed)} failed`;
+  if (s.done === s.total) return 'Done';
+  if (s.done) return `${pct}% translated`;
+  return 'Ready';
+}
+
+function renderFiles() {
+  const to = el.to.value;
+  el.fileList.replaceChildren(
+    ...state.files.map((entry) => {
+      const s = fileStats(entry.doc, to);
+      const active = entry.id === state.activeId;
+      const pct = s.total ? Math.round((100 * s.done) / s.total) : 0;
+      const li = h('li', { class: `file${active ? ' active' : ''}${s.failed ? ' has-failed' : ''}` });
+      const main = h(
+        'button',
+        { type: 'button', class: 'file-main', 'aria-current': active ? 'true' : false, title: entry.name },
+        h('span', { class: 'file-name' }, entry.name),
+        h('span', { class: 'file-status' }, statusLabel(s)),
+        h('span', { class: 'file-meta' }, `${entry.doc.format.toUpperCase()}, ${fmtNum(entry.doc.cues.length)} cues`),
+        h('span', { class: 'file-bar', 'aria-hidden': 'true' }, h('i', { style: `width:${pct}%` })),
+      );
+      main.addEventListener('click', () => activate(entry.id));
+      const remove = h(
+        'button',
+        { type: 'button', class: 'file-remove', 'aria-label': `Remove ${entry.name}`, disabled: state.running },
+        '×',
+      );
+      remove.addEventListener('click', () => removeFile(entry.id));
+      li.append(main, remove);
+      return li;
+    }),
+  );
+}
+
+function renderSummary() {
+  const docs = state.files.map((f) => f.doc);
+  if (!docs.length) return el.fileInfo.replaceChildren();
+
+  const to = el.to.value;
+  const cues = docs.flatMap((d) => d.cues);
+  const translatable = cues.filter((c) => !c.skip);
+  const todo = translatable.filter((c) => !isDoneFor(c, to));
+  const unique = groupByCore(todo).size;
+
+  const first =
+    docs.length === 1
+      ? `${docs[0].format.toUpperCase()}, ${fmtNum(cues.length)} cues, ${formatDuration(docs[0].cues.at(-1)?.end ?? 0)} long`
+      : `${fmtNum(cues.length)} cues in total`;
+  let second;
+  if (!translatable.length) second = 'No translatable text found';
+  else if (!unique) second = `Everything is already translated into ${langName(to)}`;
+  else second = `${fmtNum(unique)} unique lines will be sent to Google Translate`;
+
+  el.fileInfo.replaceChildren(h('span', {}, first), h('span', {}, second));
+}
+
+/** Updates every control that depends on how many files are loaded. */
+function refreshChrome() {
+  const n = state.files.length;
+  el.files.hidden = n === 0;
+  el.exportBar.hidden = n === 0;
+  el.cuesWrap.hidden = n === 0;
+  el.filesTitle.textContent = n > 1 ? `${n} files` : 'File';
+  el.clearFiles.disabled = state.running;
+  el.drop.classList.toggle('disabled', state.running);
+  el.translate.disabled = n === 0 || state.running;
+  el.translate.textContent = n > 1 ? `Translate all ${n} files` : 'Translate';
+  el.downloadAll.hidden = n < 2;
+  el.download.textContent = n > 1 ? 'Download this file' : 'Download';
+  el.download.classList.toggle('primary', n < 2);
+  renderFiles();
+  renderSummary();
 }
 
 /* ---------- translation ---------- */
@@ -254,6 +396,13 @@ async function postBatch(texts, from, to, signal, onWait) {
 
     if (res.ok) return res.json();
 
+    // 404, 405 or 501 on the API path means a plain file server is running instead of server.js.
+    if ([404, 405, 501].includes(res.status)) {
+      const err = new Error(BACKEND_HINT);
+      err.fatal = true;
+      throw err;
+    }
+
     const data = await res.json().catch(() => ({}));
     if (res.status === 429) {
       if (++attempt > 4) {
@@ -282,21 +431,36 @@ function setProgress(done, total, message) {
 function setRunningUI(running) {
   el.translate.hidden = running;
   el.cancel.hidden = !running;
-  el.translate.disabled = running || !state.doc;
+  refreshChrome();
 }
 
+/**
+ * Translates every loaded file in one pass: lines from all files are de-duplicated together,
+ * sent in batches, then written back to the cues they came from.
+ */
 async function runTranslation({ onlyFailed = false } = {}) {
-  const doc = state.doc;
-  if (!doc || state.running) return;
+  if (!state.files.length || state.running) return;
 
   const from = el.from.value;
   const to = el.to.value;
   if (from === to) return toast('Choose two different languages.');
 
-  const targets = doc.cues.filter((c) => !c.skip && (!onlyFailed || c.status === 'failed'));
-  if (!targets.length) return toast('There is nothing to translate.');
+  const allCues = state.files.flatMap((f) => f.doc.cues);
+  const targets = allCues.filter(
+    (c) => !c.skip && (onlyFailed ? c.status === 'failed' : !isDoneFor(c, to)),
+  );
+  if (!targets.length) {
+    return toast(
+      onlyFailed
+        ? 'There is nothing to retry.'
+        : `Everything is already translated into ${langName(to)}. Pick another language to translate again.`,
+    );
+  }
+  const targetSet = new Set(targets);
+  const fileCount = state.files.filter((f) => f.doc.cues.some((c) => targetSet.has(c))).length;
 
   saveSettings();
+  state.detected = null;
   state.running = true;
   state.controller = new AbortController();
   const { signal } = state.controller;
@@ -311,11 +475,12 @@ async function runTranslation({ onlyFailed = false } = {}) {
   const progress = (message) => {
     const done = countDone();
     setProgress(done, targets.length, message ?? `Translated ${fmtNum(done)} of ${fmtNum(targets.length)} lines`);
+    renderFiles();
   };
   const key = (core) => `${from}\u0000${to}\u0000${core}`;
-  const finish = (c, text) => { c.trans = text; c.status = 'done'; };
+  const finish = (c, text) => { c.trans = text; c.status = 'done'; c.lang = to; };
 
-  // Identical lines ("Yes.", "What?") are translated once.
+  // Identical lines ("Yes.", "What?") are translated once, even across different files.
   const groups = groupByCore(targets);
   const todo = [];
   for (const [core, list] of groups) {
@@ -326,6 +491,7 @@ async function runTranslation({ onlyFailed = false } = {}) {
 
   const batches = makeBatches(todo, BATCH);
   let rateLimited = false;
+  let fatal = false;
   let lastError = '';
   progress();
   renderCues();
@@ -351,9 +517,10 @@ async function runTranslation({ onlyFailed = false } = {}) {
       batch.forEach((core) => groups.get(core).forEach((c) => { c.status = 'failed'; }));
       lastError = err.message;
       if (err.rateLimited) { rateLimited = true; break; }
+      if (err.fatal) { fatal = true; break; }
     }
     progress();
-    if (state.doc === doc) renderCues();
+    renderCues();
     await sleep(400, signal).catch(() => {});
   }
 
@@ -365,18 +532,16 @@ async function runTranslation({ onlyFailed = false } = {}) {
   state.controller = null;
   setRunningUI(false);
 
-  if (state.doc !== doc) return; // a new file was loaded meanwhile
-
   const done = countDone();
   const failed = targets.filter((c) => c.status === 'failed').length;
-  const detected = state.detected
-    ? ` Detected source language: ${LANG_NAMES.get(state.detected.toLowerCase()) ?? state.detected}.`
-    : '';
+  const where = fileCount > 1 ? ` across ${fileCount} files` : '';
+  const detected = state.detected ? ` Detected source language: ${langName(state.detected)}.` : '';
   let message;
-  if (aborted) message = `Cancelled. ${fmtNum(done)} lines were translated.`;
+  if (fatal) { message = lastError; checkServer(); }
+  else if (aborted) message = `Cancelled. ${fmtNum(done)} lines were translated.`;
   else if (rateLimited) message = `Stopped: Google is rate limiting this server. ${fmtNum(failed)} lines are waiting. Wait a few minutes, then press Retry failed.`;
-  else if (failed) message = `${fmtNum(done)} lines translated, ${fmtNum(failed)} failed. ${lastError}`.trim();
-  else message = `Done. ${fmtNum(done)} lines translated.${detected}`;
+  else if (failed) message = `${fmtNum(done)} lines translated${where}, ${fmtNum(failed)} failed. ${lastError}`.trim();
+  else message = `Done. ${fmtNum(done)} lines translated${where}.${detected}`;
 
   setProgress(done, targets.length, message);
   renderCues();
@@ -405,7 +570,7 @@ function updatePreview() {
   el.prevCue.disabled = el.nextCue.disabled = false;
 }
 
-/* ---------- cue list ---------- */
+/* ---------- cue list (the active file) ---------- */
 
 function visibleIndexes() {
   const cues = state.doc.cues;
@@ -442,10 +607,16 @@ function rowFor(i) {
     });
     ta.value = c.trans ?? '';
     ta.addEventListener('input', () => {
+      const before = c.status;
       c.trans = ta.value;
       c.status = ta.value.trim() ? 'done' : 'idle';
+      c.lang = el.to.value;
       autosize(ta);
       if (state.selected === i) updatePreview();
+      if (before !== c.status) {
+        renderFiles();
+        renderSummary();
+      }
     });
     cell.append(ta);
   }
@@ -469,8 +640,9 @@ function renderCues() {
   el.pgPrev.disabled = state.page === 0;
   el.pgNext.disabled = state.page >= pages - 1;
 
-  const failed = state.doc.cues.filter((c) => c.status === 'failed').length;
-  el.failCount.textContent = String(failed);
+  // Failed lines are counted across all files, because Retry failed covers all of them.
+  const failed = state.files.reduce((n, f) => n + f.doc.cues.filter((c) => c.status === 'failed').length, 0);
+  el.failCount.textContent = fmtNum(failed);
   el.retry.hidden = failed === 0 || state.running;
 }
 
@@ -495,32 +667,60 @@ function stepCue(delta) {
 
 /* ---------- export ---------- */
 
-function outputName(fmt) {
-  const base = state.fileName.replace(/\.[^.]+$/, '') || 'subtitles';
+const outputFormat = (doc) => (el.outFmt.value === 'same' ? doc.format : el.outFmt.value);
+
+function outputName(name, fmt) {
+  const base = name.replace(/\.[^.]+$/, '') || 'subtitles';
   return `${base}.${el.to.value}.${fmt}`;
 }
 
-function download() {
-  if (!state.doc) return;
-  const fmt = el.outFmt.value;
-  const opts = readOpts();
-  const content = buildOutput(state.doc, fmt, opts);
-  const blob = new Blob([opts.bom ? `\uFEFF${content}` : content], { type: 'text/plain;charset=utf-8' });
+function saveBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
-  const a = h('a', { href: url, download: outputName(fmt) });
+  const a = h('a', { href: url, download: filename });
   document.body.append(a);
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 3000);
+}
 
-  const untranslated = state.doc.cues.filter((c) => !c.skip && !c.trans).length;
-  if (untranslated) toast(`Saved. ${fmtNum(untranslated)} lines are not translated yet and keep their original text.`);
+function untranslatedCount(docs) {
+  const to = el.to.value;
+  return docs.reduce((n, d) => n + d.cues.filter((c) => !c.skip && !isDoneFor(c, to)).length, 0);
+}
+
+function download() {
+  const doc = state.doc;
+  if (!doc) return;
+  const fmt = outputFormat(doc);
+  const opts = readOpts();
+  const content = buildOutput(doc, fmt, opts);
+  saveBlob(
+    new Blob([opts.bom ? `\uFEFF${content}` : content], { type: 'text/plain;charset=utf-8' }),
+    outputName(state.fileName, fmt),
+  );
+  const left = untranslatedCount([doc]);
+  if (left) toast(`Saved. ${fmtNum(left)} lines are not translated yet and keep their original text.`);
+}
+
+function downloadAll() {
+  if (!state.files.length) return;
+  const opts = readOpts();
+  const used = new Set();
+  const entries = state.files.map(({ name, doc }) => {
+    const fmt = outputFormat(doc);
+    const content = buildOutput(doc, fmt, opts);
+    return { name: uniqueName(outputName(name, fmt), used), data: opts.bom ? `\uFEFF${content}` : content };
+  });
+  saveBlob(makeZip(entries), `subtitles-${el.to.value}.zip`);
+  const left = untranslatedCount(state.files.map((f) => f.doc));
+  if (left) toast(`Saved. ${fmtNum(left)} lines are not translated yet and keep their original text.`);
+  else toast(`Saved ${entries.length} files in one ZIP.`);
 }
 
 async function copyOutput() {
   if (!state.doc) return;
   try {
-    await navigator.clipboard.writeText(buildOutput(state.doc, el.outFmt.value, readOpts()));
+    await navigator.clipboard.writeText(buildOutput(state.doc, outputFormat(state.doc), readOpts()));
     toast('Copied to the clipboard.');
   } catch {
     toast("Couldn't copy. Use Download instead.");
@@ -530,13 +730,20 @@ async function copyOutput() {
 /* ---------- events ---------- */
 
 el.file.addEventListener('change', () => {
-  const f = el.file.files?.[0];
-  if (f) loadFile(f);
+  const picked = [...(el.file.files ?? [])];
   el.file.value = '';
+  loadFiles(picked);
 });
 
+el.drop.addEventListener('click', (e) => {
+  if (state.running) { e.preventDefault(); busyToast(); }
+});
 el.drop.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.file.click(); }
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    if (state.running) busyToast();
+    else el.file.click();
+  }
 });
 ['dragenter', 'dragover'].forEach((t) =>
   el.drop.addEventListener(t, (e) => { e.preventDefault(); el.drop.classList.add('over'); }),
@@ -544,34 +751,47 @@ el.drop.addEventListener('keydown', (e) => {
 ['dragleave', 'drop'].forEach((t) =>
   el.drop.addEventListener(t, () => el.drop.classList.remove('over')),
 );
-// A file dropped anywhere on the page is loaded; stop the browser from opening it instead.
+// Files dropped anywhere on the page are loaded; stop the browser from opening them instead.
 window.addEventListener('dragover', (e) => e.preventDefault());
 window.addEventListener('drop', (e) => {
   e.preventDefault();
-  const f = e.dataTransfer?.files?.[0];
-  if (f) loadFile(f);
+  loadFiles(e.dataTransfer?.files ?? []);
 });
 
 el.pasteLoad.addEventListener('click', () => {
   if (!el.pasteArea.value.trim()) return toast('Paste some subtitle text first.');
-  ingest(el.pasteArea.value, '');
+  if (state.running) return busyToast();
+  addFiles([{ name: `pasted-${++state.pasted}`, raw: el.pasteArea.value }]);
+  el.pasteArea.value = '';
 });
-el.sample.addEventListener('click', () => ingest(SAMPLE, 'sample.srt'));
+el.sample.addEventListener('click', () => {
+  if (state.running) return busyToast();
+  state.files = [];
+  resetActive();
+  addFiles([{ name: 'sample.srt', raw: SAMPLE }]);
+});
 
 el.from.addEventListener('change', () => { syncSwap(); saveSettings(); });
-el.to.addEventListener('change', () => { saveSettings(); renderCues(); });
+el.to.addEventListener('change', () => {
+  saveSettings();
+  refreshChrome();
+  renderCues();
+});
 el.swap.addEventListener('click', () => {
   const f = el.from.value;
   el.from.value = el.to.value;
   el.to.value = f;
   syncSwap();
   saveSettings();
+  refreshChrome();
+  renderCues();
 });
-[el.optTags, el.optBi, el.optBom].forEach((c) => c.addEventListener('change', saveSettings));
+[el.optTags, el.optBi, el.optBom, el.outFmt].forEach((c) => c.addEventListener('change', saveSettings));
 
 el.translate.addEventListener('click', () => runTranslation());
 el.retry.addEventListener('click', () => runTranslation({ onlyFailed: true }));
 el.cancel.addEventListener('click', () => state.controller?.abort());
+el.clearFiles.addEventListener('click', clearFiles);
 
 el.search.addEventListener('input', () => {
   state.query = el.search.value;
@@ -584,6 +804,7 @@ el.prevCue.addEventListener('click', () => stepCue(-1));
 el.nextCue.addEventListener('click', () => stepCue(1));
 
 el.download.addEventListener('click', download);
+el.downloadAll.addEventListener('click', downloadAll);
 el.copy.addEventListener('click', copyOutput);
 
 el.theme.addEventListener('click', () => {
@@ -596,5 +817,21 @@ el.theme.addEventListener('click', () => {
 
 /* ---------- start ---------- */
 
+async function checkServer() {
+  let ok = false;
+  if (location.protocol !== 'file:') {
+    try {
+      const res = await fetch('/api/health');
+      ok = res.ok && (await res.json()).ok === true;
+    } catch {
+      ok = false;
+    }
+  }
+  el.serverWarn.textContent = ok ? '' : BACKEND_HINT;
+  el.serverWarn.hidden = ok;
+}
+
 fillLanguages();
 updatePreview();
+refreshChrome();
+checkServer();
